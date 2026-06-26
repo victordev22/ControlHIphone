@@ -64,10 +64,12 @@ final class HomeViewModel {
         let now   = Date()
         let today = cal.startOfDay(for: now)
 
-        currentUserHours = list.first(where: { h in
+        // Prefer the active session (hora_apagado == nil); fall back to the last session today
+        let todayRecords = list.filter { h in
             h.user == userId &&
             h.hora_encendido.map { cal.isDate($0, inSameDayAs: today) } == true
-        })
+        }
+        currentUserHours = todayRecords.first(where: { $0.isOn }) ?? todayRecords.last
 
         let weekComponents = cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: now)
         var usageMap: [String: TimeInterval] = [:]

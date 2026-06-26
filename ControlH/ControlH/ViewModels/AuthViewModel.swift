@@ -50,9 +50,14 @@ final class AuthViewModel {
         var roles: [Role] = []
         if let realmAccess = json["realm_access"] as? [String: Any],
            let rolesArray  = realmAccess["roles"] as? [String] {
-            roles = rolesArray.map { Role(erole: $0) }
+            // Keycloak uses "admin"/"user"; normalize to Spring Security "ROLE_" convention
+            let map: [String: String] = ["admin": "ROLE_ADMIN", "user": "ROLE_USER"]
+            roles = rolesArray
+                .map  { r in Role(erole: map[r.lowercased()] ?? r) }
+                .filter { $0.erole.hasPrefix("ROLE_") }  // drop system roles (offline_access, etc.)
         }
         let principalRole = roles.first(where: { $0.erole == "ROLE_ADMIN" })?.erole
+                         ?? roles.first(where: { $0.erole == "ROLE_USER" })?.erole
                          ?? roles.first?.erole
 
         currentUser = User(nickname: nickname, email: email, roles: roles, role: principalRole)
