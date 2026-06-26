@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import Observation
 import AuthenticationServices
+import CryptoKit
 
 @MainActor
 @Observable
@@ -26,6 +27,7 @@ final class AuthViewModel {
     private let authService  = AuthService.shared
     private let tokenManager = TokenManager.shared
     private var keycloakSession: ASWebAuthenticationSession?
+    private var codeVerifier: String?
 
     init() {
         let token = tokenManager.getToken()
@@ -149,7 +151,11 @@ final class AuthViewModel {
     // MARK: - Keycloak SSO
 
     func signInWithKeycloak() {
-        guard let authURL = buildKeycloakAuthURL() else { return }
+        let verifier  = pkceVerifier()
+        let challenge = pkceChallenge(from: verifier)
+        codeVerifier  = verifier
+
+        guard let authURL = buildKeycloakAuthURL(challenge: challenge) else { return }
         isLoading = true
         clearMessages()
 
@@ -161,6 +167,7 @@ final class AuthViewModel {
             Task { @MainActor in
                 defer { self.isLoading = false }
                 if let error {
+                    self.codeVerifier = nil
                     if (error as? ASWebAuthenticationSessionError)?.code == .canceledLogin { return }
                     self.errorMessage = error.localizedDescription
                     return
@@ -169,6 +176,7 @@ final class AuthViewModel {
                       let code = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
                           .queryItems?.first(where: { $0.name == "code" })?.value
                 else {
+                    self.codeVerifier = nil
                     self.errorMessage = "No se recibió el código de autorización."
                     return
                 }
@@ -181,39 +189,67 @@ final class AuthViewModel {
         session.start()
     }
 
-    private func buildKeycloakAuthURL() -> URL? {
+    private func buildKeycloakAuthURL(challenge: String) -> URL? {
         var components = URLComponents(string: Constants.keycloakIssuer + "/protocol/openid-connect/auth")
         components?.queryItems = [
-            URLQueryItem(name: "client_id",     value: Constants.clientID),
-            URLQueryItem(name: "redirect_uri",  value: Constants.redirectURI),
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "scope",         value: "openid profile email"),
+            URLQueryItem(name: "client_id",             value: Constants.clientID),
+            URLQueryItem(name: "redirect_uri",          value: Constants.redirectURI),
+            URLQueryItem(name: "response_type",         value: "code"),
+            URLQueryItem(name: "scope",                 value: "openid profile email"),
+            URLQueryItem(name: "code_challenge",        value: challenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
         ]
         return components?.url
     }
 
     private func exchangeKeycloakCode(_ code: String) async {
+        defer { codeVerifier = nil }
         guard let tokenURL = URL(string: Constants.keycloakIssuer + "/protocol/openid-connect/token") else { return }
+
+        // Build the form body via URLComponents so all values are percent-encoded correctly
+        var form = URLComponents()
+        var items = [
+            URLQueryItem(name: "grant_type",   value: "authorization_code"),
+            URLQueryItem(name: "client_id",    value: Constants.clientID),
+            URLQueryItem(name: "code",         value: code),
+            URLQueryItem(name: "redirect_uri", value: Constants.redirectURI),
+        ]
+        if let verifier = codeVerifier {
+            items.append(URLQueryItem(name: "code_verifier", value: verifier))
+        }
+        form.queryItems = items
+
         var request = URLRequest(url: tokenURL)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        let bodyParams = [
-            "grant_type=authorization_code",
-            "client_id=\(Constants.clientID)",
-            "code=\(code)",
-            "redirect_uri=\(Constants.redirectURI)"
-        ].joined(separator: "&")
-        request.httpBody = bodyParams.data(using: .utf8)
+        request.httpBody = form.query?.data(using: .utf8)
 
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
             let tokenResponse = try JSONDecoder().decode(KeycloakTokenResponse.self, from: data)
             tokenManager.saveToken(tokenResponse.access_token)
+            // Populate user directly from JWT — avoids an API round-trip that could 401
+            parseTokenAndPopulateUser(tokenResponse.access_token)
             isAuthenticated = true
-            await fetchCurrentUser()
+            if let email = currentUser?.email, !email.isEmpty {
+                await bindNovu(email: email)
+            }
         } catch {
             errorMessage = "Error al autenticar con Keycloak: \(error.localizedDescription)"
         }
+    }
+
+    // MARK: - PKCE helpers
+
+    private func pkceVerifier() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes).base64URLString()
+    }
+
+    private func pkceChallenge(from verifier: String) -> String {
+        let hash = SHA256.hash(data: Data(verifier.utf8))
+        return Data(hash).base64URLString()
     }
 
     // MARK: - Logout
@@ -272,9 +308,16 @@ final class KeycloakPresentationContext: NSObject, ASWebAuthenticationPresentati
     }
 }
 
-// MARK: - Base64URL decoding helper
+// MARK: - Base64URL helpers
 
 extension Data {
+    func base64URLString() -> String {
+        base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
     init?(base64URLEncoded string: String) {
         var base64 = string
             .replacingOccurrences(of: "-", with: "+")

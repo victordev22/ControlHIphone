@@ -49,9 +49,23 @@ struct MainTabView: View {
 
 private struct LogoutTab: View {
     @Environment(AuthViewModel.self) var authVM
+    @State private var confirmLogout = false
 
     var body: some View {
-        Color.clear
-            .onAppear { authVM.logout() }
+        VStack(spacing: 24) {
+            Spacer()
+            Image(systemName: "rectangle.portrait.and.arrow.right")
+                .font(.system(size: 52))
+                .foregroundColor(.secondary)
+            Text("¿Cerrar sesión?")
+                .font(.title2.bold())
+            Button("Salir", role: .destructive) {
+                authVM.logout()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
